@@ -203,8 +203,7 @@ pub struct Worker<'a> {
 }
 
 impl<'a> Worker<'a> {
-    /// Execute a single fuzz case until completion
-    pub fn run_fuzz_case(&mut self) {
+    pub fn reset(&mut self) {
         // Load the original snapshot registers
         self.vm.guest_regs = self.snapshot.snapshot_info.regs;
        
@@ -232,18 +231,24 @@ impl<'a> Worker<'a> {
                 "intel", "volatile");
             });
         }
-        
+    }
+
+    /// Execute a single fuzz case until completion
+    pub fn run_fuzz_case(&mut self, full_coverage_run: bool) -> bool {
         // Counter of number of single steps we should perform
         let mut single_step = 0;
+        let mut cov = false;
 
         'vm_loop: loop {
             // Check if single stepping is requested
-            if single_step > 0 {
+            if single_step > 0 || full_coverage_run {
                 // Enable single stepping
                 self.vm.guest_regs.rfl |= 1 << 8;
 
                 // Decrement number of single steps requested
-                single_step -= 1;
+                if single_step > 0 {
+                    single_step -= 1;
+                }
             } else {
                 // Disable single stepping
                 self.vm.guest_regs.rfl &= !(1 << 8);
@@ -251,7 +256,7 @@ impl<'a> Worker<'a> {
 
             // Set the pre-emption timer for randomly breaking into the VM
             // to record coverage information
-            self.vm.preemption_timer = Some((self.rng.rand() & 0xffff) as u32);
+            self.vm.preemption_timer = Some((self.rng.rand() & 0xfff) as u32);
 
             // Run the VM until a VM exit
             let vmexit = self.vm.run();
@@ -259,13 +264,29 @@ impl<'a> Worker<'a> {
             match vmexit {
                 VmExit::Exception(PageFault { addr, write, .. }) => {
                     if self.translate(addr, write).is_some() {
+                        if single_step > 0 {
+                            print!("vmexit , {:x?}\n", vmexit);
+                        }
                         continue 'vm_loop;
                     }
+                    print!("vmexit {:#x} | {:x?}\n",
+                        self.vm.guest_regs.rip, vmexit);
                 }
                 VmExit::Exception(InvalidOpcode) => {
+                    if single_step > 0 {
+                        print!("vmexit , {:x?}\n", vmexit);
+                    }
+
+                    {
+                        let mut buf = [0, 0];
+                        self.read(VirtAddr(self.vm.guest_regs.rip), &mut buf).unwrap();
+                        assert_eq!(buf, [0x0f, 0x05], "InvalidOpcode but not syscall");
+                    }
+
                     // We assume invalid opcodes are syscalls
                     let syscall = self.vm.guest_regs.rax;
                     match syscall {
+                        /*
                         0x7 => {
                             // NtDeviceIoControlFile(), return
                             // STATUS_INVALID_PARAMETER
@@ -284,6 +305,18 @@ impl<'a> Worker<'a> {
                             self.vm.guest_regs.rip += 2;
                             continue 'vm_loop;
                         }
+                        */
+                        3 => { // linux sys_close
+                            self.vm.guest_regs.rax  = 0;
+                            self.vm.guest_regs.rip += 2;
+                            continue 'vm_loop;
+                        }
+                        0xe7 => { // linux sys_exit_group
+                            break 'vm_loop;
+                        }
+                        1 => { // linux sys_write
+                            break 'vm_loop;
+                        }
                         x @ _ => print!("Unhandled syscall {:#x}\n", x),
                     }
                 }
@@ -291,6 +324,8 @@ impl<'a> Worker<'a> {
                     if self.snapshot.coverage.lock()
                             .insert(self.vm.guest_regs.rip) {
                         single_step = 1000;
+                        print!("cov: {:#x}\n", self.vm.guest_regs.rip);
+                        cov = true;
                     }
                     continue 'vm_loop;
                 }
@@ -298,6 +333,8 @@ impl<'a> Worker<'a> {
                     if self.snapshot.coverage.lock()
                             .insert(self.vm.guest_regs.rip) {
                         single_step = 1000;
+                        print!("cov: {:#x}\n", self.vm.guest_regs.rip);
+                        cov = true;
                     }
                     continue 'vm_loop;
                 }
@@ -314,6 +351,8 @@ impl<'a> Worker<'a> {
 
         // Update number of fuzz cases
         self.snapshot.fuzz_cases.fetch_add(1, Ordering::SeqCst);
+
+        cov
     }
 
     /// Read the contents of the virtual memory at `vaddr` in the guest into

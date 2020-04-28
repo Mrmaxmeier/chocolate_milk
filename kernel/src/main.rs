@@ -28,6 +28,8 @@ pub mod time;
 pub mod vtx;
 pub mod snapshotted_app;
 
+use alloc::vec::Vec;
+
 use lockcell::LockCell;
 use page_table::PhysAddr;
 use core_locals::LockInterrupts;
@@ -97,6 +99,7 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // get free reign of execution, we've intialized all cores to a state where
     // NMIs and soft reboots work.
     acpi::core_checkin();
+    if core!().id != 0 { cpu::halt(); }
 
     {
         use core::sync::atomic::Ordering;
@@ -108,19 +111,23 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
             LockCell::new(None);
 
         // Create the master snapshot, and fork from it for all cores
+
+        let server = "192.168.122.1:1911";
+        let name = "falkdump";
+
         let snapshot = {
             let mut snap = SNAPSHOT.lock();
             if snap.is_none() {
-                *snap = Some(
-                    Arc::new(
-                        SnapshottedApp::new("192.168.101.1:1911", "falkdump")
-                    )
-                );
+                *snap = Some(Arc::new(SnapshottedApp::new(server, name)));
             }
             snap.as_ref().unwrap().clone()
         };
 
-        //if core!().id != 0 { cpu::halt(); }
+
+        let fuzz_meta = crate::net::netmapping::NetMapping::new(
+            server, &format!("{}.fuzz", name), true)
+                .expect("Failed to netmap memory file for snapshotted app");
+
 
         // Create a new worker for the snapshot
         let mut worker = snapshot.worker();
@@ -130,9 +137,25 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
         let it = cpu::rdtsc();
         let mut next_print = time::future(1_000_000);
 
-        /// Buffer for the file contents in WinRAR
-        const BUFFER_ADDR: VirtAddr = VirtAddr(0x02bcbb1b7040);
-        const BUFFER_SIZE: usize    = 0x2123;
+        let buffer_addr;
+        let buffer_size;
+        {
+            use core::convert::TryInto;
+            buffer_addr = u64::from_le_bytes(fuzz_meta[..8].try_into().unwrap());
+            buffer_size = usize::from_le_bytes(fuzz_meta[8..16].try_into().unwrap());
+        }
+
+        print!("buffer_addr: {:#x}\n", buffer_addr);
+        print!("buffer_size: {:#x}\n", buffer_size);
+        let BUFFER_ADDR: VirtAddr = VirtAddr(buffer_addr);
+        let BUFFER_SIZE: usize    = buffer_size;
+
+        let mut corpus = Vec::new(); // TODO: share corpus between cores
+        let mut input = vec![0; BUFFER_SIZE];
+        worker.read(BUFFER_ADDR, &mut input).unwrap();
+        corpus.push(input.clone());
+
+        let mut full_coverage_run = true;
 
         loop {
             if core!().id == 0 && cpu::rdtsc() >= next_print {
@@ -145,16 +168,37 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
                 next_print = time::future(1_000_000);
             }
 
-            // Corrupt the input
-            {
-                for _ in 0..worker.rng.rand() % 64 {
-                    let offset = worker.rng.rand() % BUFFER_SIZE;
-                    worker.write(VirtAddr(BUFFER_ADDR.0 + offset as u64),
-                        &[worker.rng.rand() as u8]).unwrap();
-                }
+            worker.reset();
+
+            if (worker.rng.rand() % 128) == 0 {
+                input.copy_from_slice(&corpus[worker.rng.rand() % corpus.len()]);
             }
 
-            worker.run_fuzz_case();
+            // Corrupt the input
+            {
+                for _ in 0..worker.rng.rand() % 4 {
+                    let offset = worker.rng.rand() % BUFFER_SIZE;
+                    input[offset as usize] = worker.rng.rand() as u8;
+                }
+            }
+            worker.write(BUFFER_ADDR, &input).unwrap();
+
+            if worker.run_fuzz_case(full_coverage_run) {
+                if !full_coverage_run {
+                    corpus.push(input.clone());
+                    print!("new seed! corpus size: {}\n", corpus.len());
+                    print!("> {:?}\n", alloc::string::String::from_utf8_lossy(&input));
+                    full_coverage_run = true;
+                } else {
+                    full_coverage_run = false;
+                }
+            } else {
+                full_coverage_run = false;
+            }
+
+            if let Some(netdev) = crate::net::NetDevice::get() {
+                let _ = netdev.recv();
+            }
         }
     }
 }
