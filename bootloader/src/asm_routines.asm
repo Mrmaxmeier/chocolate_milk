@@ -259,6 +259,7 @@ _enter64:
 	xor eax, eax
 	or  eax, (1 <<  9) ; OSFXSR
 	or  eax, (1 << 10) ; OSXMMEXCPT
+	or  eax, (1 << 18) ; OSXSAVE
 	or  eax, (1 <<  5) ; PAE
 	or  eax, (1 <<  3) ; DE
 	mov cr4, eax

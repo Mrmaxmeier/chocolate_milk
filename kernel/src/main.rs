@@ -69,6 +69,20 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
         unsafe { acpi::init() }
     }
 
+    fn enable_avx() {
+        let cpu_features = cpu::get_cpu_features();
+        assert!(cpu_features.avx, "AVX not supported");
+        unsafe {
+        llvm_asm!(r#"
+            xor ecx, ecx
+            xgetbv
+            or eax, 7
+            xsetbv
+            "# ::: "rcx", "rax", "memory" : "volatile", "intel");
+        }
+    }
+    enable_avx();
+
     // Enable the APIC timer
     unsafe { core!().apic().lock().as_mut().unwrap().enable_timer(); }
 
