@@ -408,6 +408,7 @@ pub struct RegisterState {
     pub rfl: u64,
 
     pub gs_base: u64,
+    pub fs_base: u64,
 
     pub fxsave: FxSave,
 }
@@ -867,6 +868,7 @@ impl Vm {
             vmwrite(Vmcs::GuestRsp, self.guest_regs.rsp);
             vmwrite(Vmcs::GuestRip, self.guest_regs.rip);
             vmwrite(Vmcs::GuestGSBase, self.guest_regs.gs_base);
+            vmwrite(Vmcs::GuestFSBase, self.guest_regs.fs_base);
 
             // Set guest rflags. Make sure the reserved bit is set and
             // interrupts are always enabled
@@ -1025,6 +1027,7 @@ impl Vm {
             self.guest_regs.rip = vmread(Vmcs::GuestRip);
             self.guest_regs.rfl = vmread(Vmcs::GuestRflags);
             self.guest_regs.gs_base = vmread(Vmcs::GuestGSBase);
+            self.guest_regs.fs_base = vmread(Vmcs::GuestFSBase);
         }
 
         // Parse the VM exit information

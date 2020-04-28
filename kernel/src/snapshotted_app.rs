@@ -97,9 +97,9 @@ impl<'a> SnapshottedApp<'a> {
         regs.rax = consume!(u64);
         regs.rsp = consume!(u64);
 
-        // XXX XXX HARDCODED RIP ALERT XXX XXX
-        regs.rip = 0x7ffe_3e825187;
-        regs.gs_base = 0x00fb_c974f000;
+        regs.rip = consume!(u64);
+        regs.gs_base = consume!(u64);
+        regs.fs_base = consume!(u64);
 
         // Parse the `FxSave` out of the info
         unsafe {
