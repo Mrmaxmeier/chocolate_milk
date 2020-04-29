@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::SystemTime;
 use std::hash::{Hash, Hasher};
 use std::net::UdpSocket;
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeSet};
 use std::collections::hash_map::DefaultHasher;
 
 use noodle::*;
@@ -29,6 +29,8 @@ fn main() -> io::Result<()> {
 
     // Buffer for sending packets (reused to prevent allocations)
     let mut sendbuf = Vec::new();
+
+    let mut coverage_db = BTreeSet::new();
 
     loop {
         // Read a UDP packet from the network
@@ -120,6 +122,28 @@ fn main() -> io::Result<()> {
                     socket.send_to(&sendbuf, src)?;
                 }
             },
+            ServerMessage::CovUpdate {
+                total_length,
+                offset,
+                chunk
+            } => {
+                if offset == 0 {
+                    coverage_db.clear();
+                }
+                for &entry in &chunk {
+                    coverage_db.insert(entry);
+                }
+                if coverage_db.len() as u64 == total_length {
+                    print!("recv'd coverage update {} entries\n", total_length);
+                }
+
+                use std::io::Write;
+                let mut f = std::fs::File::create("/tmp/coverage_log").unwrap();
+                f.write_all(b"rip_u64\n").unwrap();
+                for &entry in &coverage_db {
+                    f.write_all(&u64::to_le_bytes(entry)).unwrap();
+                }
+            }
             x @ _ => panic!("Unhandled packet {:#?}\n", x),
         }
     }

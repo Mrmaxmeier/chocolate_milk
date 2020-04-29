@@ -47,5 +47,11 @@ pub enum ServerMessage<'a> {
 
     /// Indicates that reading the file failed
     ReadErr,
+
+    CovUpdate {
+        total_length: u64,
+        offset: u64,
+        chunk: Cow<'a, [u64]>,
+    }
 });
 

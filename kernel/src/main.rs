@@ -103,7 +103,6 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     {
         use core::sync::atomic::Ordering;
         use alloc::sync::Arc;
-        use page_table::VirtAddr;
 
         static SNAPSHOT:
             LockCell<Option<Arc<SnapshottedApp>>, LockInterrupts> =
@@ -135,12 +134,6 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
             CorpusHandle::new(corpus.as_ref().unwrap().clone())
         };
 
-
-        let fuzz_meta = crate::net::netmapping::NetMapping::new(
-            server, &format!("{}.fuzz", name), true)
-                .expect("Failed to netmap memory file for snapshotted app");
-
-
         // Create a new worker for the snapshot
         let mut worker = snapshot.worker();
 
@@ -149,13 +142,8 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
         let it = cpu::rdtsc();
         let mut next_print = time::future(1_000_000);
 
-        let buffer_addr;
-        let buffer_size;
-        {
-            use core::convert::TryInto;
-            buffer_addr = VirtAddr(u64::from_le_bytes(fuzz_meta[..8].try_into().unwrap()));
-            buffer_size = usize::from_le_bytes(fuzz_meta[8..16].try_into().unwrap());
-        }
+        let buffer_addr = snapshot.buffer_addr;
+        let buffer_size = snapshot.buffer_size;
 
         print!("buffer_addr: {:#x}\n", buffer_addr.0);
         print!("buffer_size: {:#x}\n", buffer_size);
@@ -211,6 +199,50 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
                 //     54660318 cases |    36516.051 fcps |   7384 coverage
 
 
+                // Send coverage updates
+                {
+                    use alloc::vec::Vec;
+                    use crate::net::{NetDevice, UdpAddress};
+                    use falktp::ServerMessage;
+                    use crate::noodle::Serialize;
+                    use alloc::borrow::Cow;
+
+
+                    let coverage = {
+                        snapshot.coverage.lock()
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>()
+                    };
+
+
+                    // Get access to a network device
+                    let netdev = NetDevice::get().unwrap();
+
+                    // Bind to a random UDP port on this network device
+                    let udp = NetDevice::bind_udp(netdev.clone()).unwrap();
+
+                    // Resolve the target
+                    let server = UdpAddress::resolve(
+                        &netdev, udp.port(), server)
+                        .expect("Couldn't resolve target address");
+
+
+                    let mut offset = 0u64;
+                    for chunk in coverage.chunks(1472/8 - 4) {
+                        let mut packet = netdev.allocate_packet();
+                        {
+                            let mut pkt = packet.create_udp(&server);
+                            ServerMessage::CovUpdate {
+                                total_length: coverage.len() as u64,
+                                offset,
+                                chunk: Cow::Borrowed(chunk),
+                            }.serialize(&mut pkt).expect("failed to serialize CovUpdate");
+                            offset += chunk.len() as u64;
+                        }
+                        netdev.send(packet, true);
+                    }
+                }
 
                 next_print = time::future(1_000_000);
 

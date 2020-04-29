@@ -46,6 +46,9 @@ pub struct SnapshottedApp<'a> {
 
     /// Number of fuzz cases performed on the target
     pub fuzz_cases: AtomicU64,
+
+    pub buffer_addr: VirtAddr,
+    pub buffer_size: usize,
 }
 
 impl<'a> SnapshottedApp<'a> {
@@ -61,6 +64,9 @@ impl<'a> SnapshottedApp<'a> {
 
         // Network map the info file contents as read-only
         let info = NetMapping::new(server, &format!("{}.info", name), true)
+            .expect("Failed to netmap info file for snapshotted app");
+
+        let fuzz_meta = NetMapping::new(server, &format!("{}.fuzz", name), true)
             .expect("Failed to netmap info file for snapshotted app");
 
         // Create a new register state
@@ -141,6 +147,10 @@ impl<'a> SnapshottedApp<'a> {
         // Make sure all of the memory has been accounted for in the snapshot
         assert!(offset == memory.len());
 
+
+        let buffer_addr = VirtAddr(u64::from_le_bytes(fuzz_meta[..8].try_into().unwrap()));
+        let buffer_size = usize::from_le_bytes(fuzz_meta[8..16].try_into().unwrap());
+
         // Return out the snapshotted application
         SnapshottedApp {
             snapshot_info: Arc::new(SnapshotInfo {
@@ -150,6 +160,8 @@ impl<'a> SnapshottedApp<'a> {
             memory:     Arc::new(memory),
             coverage:   LockCell::new(BTreeSet::new()),
             fuzz_cases: AtomicU64::new(0),
+            buffer_addr,
+            buffer_size,
         }
     }
 
