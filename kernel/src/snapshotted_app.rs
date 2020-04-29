@@ -365,9 +365,6 @@ impl<'a> Worker<'a> {
                 }
                 x @ _ => panic!("Unhandled VM exit {:?}", x),
             }
-
-            // Unhandled VM exit, break
-            break 'vm_loop;
         }
 
         // Update number of fuzz cases

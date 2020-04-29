@@ -153,19 +153,17 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
         let buffer_size;
         {
             use core::convert::TryInto;
-            buffer_addr = u64::from_le_bytes(fuzz_meta[..8].try_into().unwrap());
+            buffer_addr = VirtAddr(u64::from_le_bytes(fuzz_meta[..8].try_into().unwrap()));
             buffer_size = usize::from_le_bytes(fuzz_meta[8..16].try_into().unwrap());
         }
 
-        print!("buffer_addr: {:#x}\n", buffer_addr);
+        print!("buffer_addr: {:#x}\n", buffer_addr.0);
         print!("buffer_size: {:#x}\n", buffer_size);
-        let BUFFER_ADDR: VirtAddr = VirtAddr(buffer_addr);
-        let BUFFER_SIZE: usize    = buffer_size;
 
         // let mut corpus = Vec::new(); // TODO: share corpus between cores
-        let mut input = vec![0; BUFFER_SIZE];
+        let mut input = vec![0; buffer_size];
         corpus.push(input.clone());
-        worker.read(BUFFER_ADDR, &mut input).unwrap();
+        worker.read(buffer_addr, &mut input).unwrap();
         corpus.push(input.clone());
 
         let mut full_coverage_run = true;
@@ -237,27 +235,27 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
                     match worker.rng.rand() % 4 {
                         0|1 => {
                             // replace
-                            let offset = worker.rng.rand() % BUFFER_SIZE;
+                            let offset = worker.rng.rand() % buffer_size;
                             input[offset as usize] = worker.rng.rand() as u8;
                         }
                         2 => {
                             // insert
-                            if BUFFER_SIZE < 2 { continue }
-                            let offset = worker.rng.rand() % (BUFFER_SIZE-1);
-                            input.copy_within(offset..BUFFER_SIZE-1, offset+1);
+                            if buffer_size < 2 { continue }
+                            let offset = worker.rng.rand() % (buffer_size-1);
+                            input.copy_within(offset..buffer_size-1, offset+1);
                             input[offset as usize] = worker.rng.rand() as u8;
                         }
                         3 => {
                             // duplicate / reduce entropy
-                            let offset_a = worker.rng.rand() % BUFFER_SIZE;
-                            let offset_b = worker.rng.rand() % BUFFER_SIZE;
+                            let offset_a = worker.rng.rand() % buffer_size;
+                            let offset_b = worker.rng.rand() % buffer_size;
                             input[offset_a as usize] = input[offset_b as usize];
                         }
                         _ => unreachable!(),
                     }
                 };
             }
-            worker.write(BUFFER_ADDR, &input).unwrap();
+            worker.write(buffer_addr, &input).unwrap();
 
             let mut pushed_new_seed = false;
             if worker.run_fuzz_case(full_coverage_run) {
