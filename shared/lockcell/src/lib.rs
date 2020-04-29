@@ -150,7 +150,7 @@ impl<T: ?Sized, I: InterruptState> LockCell<T, I> {
         while self.release.load(Ordering::SeqCst) != ticket {
             // If the current core is the owner of the load
             if self.owner.load(Ordering::SeqCst) == core_id {
-                panic!("Deadlock detected");
+                panic!("Deadlock detected core: {}, ticket: {}", core_id, ticket);
             }
 
             if time_threshold > 0 {

@@ -27,13 +27,13 @@ pub mod net;
 pub mod time;
 pub mod vtx;
 pub mod snapshotted_app;
-
-use alloc::vec::Vec;
+pub mod corpus;
 
 use lockcell::LockCell;
 use page_table::PhysAddr;
 use core_locals::LockInterrupts;
 use snapshotted_app::SnapshottedApp;
+use corpus::{Corpus, CorpusHandle};
 
 /// Release the early boot stack such that other cores can use it by marking
 /// it as available
@@ -99,7 +99,6 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // get free reign of execution, we've intialized all cores to a state where
     // NMIs and soft reboots work.
     acpi::core_checkin();
-    if core!().id != 0 { cpu::halt(); }
 
     {
         use core::sync::atomic::Ordering;
@@ -108,6 +107,11 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
 
         static SNAPSHOT:
             LockCell<Option<Arc<SnapshottedApp>>, LockInterrupts> =
+            LockCell::new(None);
+
+
+        static CORPUS:
+            LockCell<Option<Arc<Corpus>>, LockInterrupts> =
             LockCell::new(None);
 
         // Create the master snapshot, and fork from it for all cores
@@ -121,6 +125,14 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
                 *snap = Some(Arc::new(SnapshottedApp::new(server, name)));
             }
             snap.as_ref().unwrap().clone()
+        };
+
+        let mut corpus = {
+            let mut corpus = CORPUS.lock();
+            if corpus.is_none() {
+                *corpus = Some(Arc::new(Corpus::new()));
+            }
+            CorpusHandle::new(corpus.as_ref().unwrap().clone())
         };
 
 
@@ -150,14 +162,19 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
         let BUFFER_ADDR: VirtAddr = VirtAddr(buffer_addr);
         let BUFFER_SIZE: usize    = buffer_size;
 
-        let mut corpus = Vec::new(); // TODO: share corpus between cores
+        // let mut corpus = Vec::new(); // TODO: share corpus between cores
         let mut input = vec![0; BUFFER_SIZE];
+        corpus.push(input.clone());
         worker.read(BUFFER_ADDR, &mut input).unwrap();
         corpus.push(input.clone());
 
         let mut full_coverage_run = true;
 
-        loop {
+        for fuzzcase in 0u64.. {
+            if fuzzcase & 0xfff == 0 {
+                corpus.sync();
+            }
+
             if core!().id == 0 && cpu::rdtsc() >= next_print {
                 let fuzz_cases = snapshot.fuzz_cases.load(Ordering::SeqCst);
                 let coverage   = snapshot.coverage.lock().len();
@@ -165,41 +182,94 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
                 print!("{:12} cases | {:12.3} fcps | {:6} coverage\n",
                        fuzz_cases, fuzz_cases as f64 / time::elapsed(it),
                        coverage);
+
+                // SETUP: kvm 4 cores
+                // sample 0x3ff
+                //       183046 cases |   183044.315 fcps |   3976 coverage
+                //    212816193 cases |   173735.439 fcps |   7077 coverage => 1224s
+
+                // sample 0xfff + more mutations
+                //     17295429 cases |   243382.899 fcps |   5981 coverage
+                //    129412997 cases |   242218.140 fcps |   6532 coverage
+                //    169076992 cases |   240706.914 fcps |   6703 coverage
+                //    228227950 cases |   238591.356 fcps |   6775 coverage => 956s
+
+                // sample 0x3ff + more mutations
+                //      9357956 cases |   179870.110 fcps |   6235 coverage
+                //     38210607 cases |   182733.999 fcps |   6970 coverage => 209s
+                //    100179233 cases |   182046.749 fcps |   7062 coverage => 550s
+                //    140375286 cases |   181025.352 fcps |   7078 coverage => 775s
+
+                // sample 0xff + more mutations
+                //      4772980 cases |    83683.670 fcps |   6117 coverage => 57s
+                //     13830754 cases |    84805.055 fcps |   6855 coverage => 163s
+                //     29630238 cases |    86082.349 fcps |   7124 coverage => 344s
+                //     64442708 cases |    88590.469 fcps |   7287 coverage => 727s
+
+                // sample 0x3f + more mutations
+                //      6450806 cases |    37259.435 fcps |   6858 coverage => 173s
+                //     10693760 cases |    37761.682 fcps |   7147 coverage => 283s
+                //     37235641 cases |    37475.980 fcps |   7364 coverage => 993s
+                //     54660318 cases |    36516.051 fcps |   7384 coverage
+
+
+
                 next_print = time::future(1_000_000);
+
+                // handle ARPs
+                if let Some(netdev) = crate::net::NetDevice::get() {
+                    let _ = netdev.recv();
+                }
             }
 
             worker.reset();
 
-            if (worker.rng.rand() % 128) == 0 {
-                input.copy_from_slice(&corpus[worker.rng.rand() % corpus.len()]);
-            }
-
-            // Corrupt the input
-            {
-                for _ in 0..worker.rng.rand() % 4 {
-                    let offset = worker.rng.rand() % BUFFER_SIZE;
-                    input[offset as usize] = worker.rng.rand() as u8;
+            if !full_coverage_run {
+                if (worker.rng.rand() % 128) == 0 {
+                    input.copy_from_slice(
+                        &corpus.entries[
+                            worker.rng.rand() % corpus.entries.len()]);
                 }
+
+                // Corrupt the input
+
+                for _ in 0..worker.rng.rand() % 4 {
+                    match worker.rng.rand() % 4 {
+                        0|1 => {
+                            // replace
+                            let offset = worker.rng.rand() % BUFFER_SIZE;
+                            input[offset as usize] = worker.rng.rand() as u8;
+                        }
+                        2 => {
+                            // insert
+                            if BUFFER_SIZE < 2 { continue }
+                            let offset = worker.rng.rand() % (BUFFER_SIZE-1);
+                            input.copy_within(offset..BUFFER_SIZE-1, offset+1);
+                            input[offset as usize] = worker.rng.rand() as u8;
+                        }
+                        3 => {
+                            // duplicate / reduce entropy
+                            let offset_a = worker.rng.rand() % BUFFER_SIZE;
+                            let offset_b = worker.rng.rand() % BUFFER_SIZE;
+                            input[offset_a as usize] = input[offset_b as usize];
+                        }
+                        _ => unreachable!(),
+                    }
+                };
             }
             worker.write(BUFFER_ADDR, &input).unwrap();
 
+            let mut pushed_new_seed = false;
             if worker.run_fuzz_case(full_coverage_run) {
                 if !full_coverage_run {
                     corpus.push(input.clone());
-                    print!("new seed! corpus size: {}\n", corpus.len());
-                    print!("> {:?}\n", alloc::string::String::from_utf8_lossy(&input));
-                    full_coverage_run = true;
-                } else {
-                    full_coverage_run = false;
+                    corpus.sync();
+                    pushed_new_seed = true;
                 }
-            } else {
-                full_coverage_run = false;
             }
-
-            if let Some(netdev) = crate::net::NetDevice::get() {
-                let _ = netdev.recv();
-            }
+            full_coverage_run = pushed_new_seed;
         }
+        panic!("That's a lot of fuzz cases!")
     }
 }
 

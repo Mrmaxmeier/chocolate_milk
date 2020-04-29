@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::alloc::Layout;
 use core::convert::TryInto;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use alloc::collections::{BTreeSet, BTreeMap};
 
 use crate::mm;
@@ -158,8 +159,9 @@ impl<'a> SnapshottedApp<'a> {
         let vm = Vm::new_user();
 
         Worker {
+            vm,
             snapshot: self,
-            vm:       vm,
+            exits:    Vec::new(),
             rng:      Rng::new(),
         }
     }
@@ -190,6 +192,12 @@ impl Rng {
     }
 }
 
+#[derive(Debug, Hash, PartialEq)]
+pub enum ExitReason {
+    UnhandledSyscall { rip: u64, rax: u64 },
+    UnhandledPageFault { rip: u64, addr: u64 },
+}
+
 /// A worker for fuzzing a `SnapshottedApp`
 pub struct Worker<'a> {
     /// Snapshotted application that we're a worker for fuzzing
@@ -197,6 +205,8 @@ pub struct Worker<'a> {
 
     /// Virtual machine for running the application
     vm: Vm,
+
+    exits: Vec<ExitReason>, // TODO: HashMap
 
     /// Random number generator seed
     pub rng: Rng,
@@ -256,7 +266,7 @@ impl<'a> Worker<'a> {
 
             // Set the pre-emption timer for randomly breaking into the VM
             // to record coverage information
-            self.vm.preemption_timer = Some((self.rng.rand() & 0xfff) as u32);
+            self.vm.preemption_timer = Some((self.rng.rand() & 0x3f) as u32 + 100);
 
             // Run the VM until a VM exit
             let vmexit = self.vm.run();
@@ -265,18 +275,24 @@ impl<'a> Worker<'a> {
                 VmExit::Exception(PageFault { addr, write, .. }) => {
                     if self.translate(addr, write).is_some() {
                         if single_step > 0 {
-                            print!("vmexit , {:x?}\n", vmexit);
+                            // print!("vmexit , {:x?}\n", vmexit);
                         }
                         continue 'vm_loop;
                     }
-                    print!("vmexit {:#x} | {:x?}\n",
-                        self.vm.guest_regs.rip, vmexit);
+
+
+                    let exit_reason = ExitReason::UnhandledPageFault {
+                        rip: self.vm.guest_regs.rip,
+                        addr: addr.0,
+                    };
+                    if !self.exits.contains(&exit_reason) {
+                        cov = true;
+                        print!("{:#x?}\n", exit_reason);
+                        self.exits.push(exit_reason);
+                    }
+                    break 'vm_loop; 
                 }
                 VmExit::Exception(InvalidOpcode) => {
-                    if single_step > 0 {
-                        print!("vmexit , {:x?}\n", vmexit);
-                    }
-
                     {
                         let mut buf = [0, 0];
                         self.read(VirtAddr(self.vm.guest_regs.rip), &mut buf).unwrap();
@@ -311,20 +327,25 @@ impl<'a> Worker<'a> {
                             self.vm.guest_regs.rip += 2;
                             continue 'vm_loop;
                         }
-                        0xe7 => { // linux sys_exit_group
-                            break 'vm_loop;
-                        }
-                        1 => { // linux sys_write
-                            break 'vm_loop;
-                        }
-                        x @ _ => print!("Unhandled syscall {:#x}\n", x),
+                        x @ _ => {
+                            let exit_reason = ExitReason::UnhandledSyscall {
+                                rax: x,
+                                rip: self.vm.guest_regs.rip,
+                            };
+                            if !self.exits.contains(&exit_reason) {
+                                cov = true;
+                                print!("{:#x?}\n", exit_reason);
+                                self.exits.push(exit_reason);
+                            }
+                            break 'vm_loop; 
+                        },
                     }
                 }
                 VmExit::Exception(DebugException) => {
                     if self.snapshot.coverage.lock()
                             .insert(self.vm.guest_regs.rip) {
                         single_step = 1000;
-                        print!("cov: {:#x}\n", self.vm.guest_regs.rip);
+                        // print!("cov: {:#x}\n", self.vm.guest_regs.rip);
                         cov = true;
                     }
                     continue 'vm_loop;
@@ -333,7 +354,7 @@ impl<'a> Worker<'a> {
                     if self.snapshot.coverage.lock()
                             .insert(self.vm.guest_regs.rip) {
                         single_step = 1000;
-                        print!("cov: {:#x}\n", self.vm.guest_regs.rip);
+                        // print!("cov: {:#x}\n", self.vm.guest_regs.rip);
                         cov = true;
                     }
                     continue 'vm_loop;
