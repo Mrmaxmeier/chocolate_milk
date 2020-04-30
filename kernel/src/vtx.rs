@@ -524,6 +524,8 @@ pub struct Vm {
 
     /// Current setting for the pin-based controls
     pinbased_controls: u64,
+
+    pub hardware_breakpoint: Option<u64>,
 }
 
 impl Vm {
@@ -617,6 +619,7 @@ impl Vm {
             page_table,
             preemption_timer: None,
             pinbased_controls: 0,
+            hardware_breakpoint: None,
         }
     }
 
@@ -874,6 +877,13 @@ impl Vm {
             // interrupts are always enabled
             vmwrite(Vmcs::GuestRflags,
                     self.guest_regs.rfl | (1 << 1) | (1 << 9));
+
+            if let Some(addr) = self.hardware_breakpoint {
+                llvm_asm!("mov dr0, $0" :: "r"(addr) :: "volatile", "intel");
+                vmwrite(Vmcs::GuestDr7, 0x402);
+            } else {
+                vmwrite(Vmcs::GuestDr7, 0x400);
+            }
         }
 
         unsafe {

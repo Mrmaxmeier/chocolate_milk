@@ -17,11 +17,14 @@ lockcell = { path = "../shared/lockcell" }
 noodle = { path = "../shared/noodle" }
 falktp = { path = "../shared/falktp" }
 aht = { path = "../shared/aht" }
+hashbrown = { version = "0.7.0", default-features = false }
+
 
 [profile.release]
 panic = "abort"
 opt-level = 2
 debug = true
+# lto = "fat" # triggers "brackets expression not supported on this target" for inline asm!?
 
 [profile.dev]
 panic = "abort"

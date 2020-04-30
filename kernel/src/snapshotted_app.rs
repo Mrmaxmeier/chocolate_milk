@@ -14,6 +14,7 @@ use crate::vtx::{Vm, FxSave, RegisterState, VmExit};
 use crate::vtx::Exception::*;
 use crate::net::netmapping::NetMapping;
 use crate::core_locals::LockInterrupts;
+use crate::progress_set::{ProgressSet, ProgressSetHandle};
 
 use lockcell::LockCell;
 use page_table::{PhysAddr, VirtAddr, PhysMem, PageType, Mapping};
@@ -42,7 +43,12 @@ pub struct SnapshottedApp<'a> {
     memory: Arc<NetMapping<'a>>,
 
     /// Coverage database containing all observed RIP values
+    // TODO: transition to ProgressSet?
     pub coverage: LockCell<BTreeSet<u64>, LockInterrupts>,
+
+    pub exits: Arc<ProgressSet<ExitReason>>,
+
+    pub corpus: Arc<ProgressSet<Vec<u8>>>,
 
     /// Number of fuzz cases performed on the target
     pub fuzz_cases: AtomicU64,
@@ -159,6 +165,8 @@ impl<'a> SnapshottedApp<'a> {
             }),
             memory:     Arc::new(memory),
             coverage:   LockCell::new(BTreeSet::new()),
+            exits:      Arc::new(ProgressSet::new()),
+            corpus:     Arc::new(ProgressSet::new()),
             fuzz_cases: AtomicU64::new(0),
             buffer_addr,
             buffer_size,
@@ -173,8 +181,10 @@ impl<'a> SnapshottedApp<'a> {
         Worker {
             vm,
             snapshot: self,
-            exits:    Vec::new(),
+            exits:    self.exits.handle(),
+            corpus:   self.corpus.handle(),
             rng:      Rng::new(),
+            hardware_breakpoint: None,
         }
     }
 }
@@ -204,8 +214,9 @@ impl Rng {
     }
 }
 
-#[derive(Debug, Hash, PartialEq)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub enum ExitReason {
+    InvalidOpcode { rip: u64 },
     UnhandledSyscall { rip: u64, rax: u64 },
     UnhandledPageFault { rip: u64, addr: u64 },
 }
@@ -216,9 +227,13 @@ pub struct Worker<'a> {
     snapshot: &'a SnapshottedApp<'a>,
 
     /// Virtual machine for running the application
-    vm: Vm,
+    pub vm: Vm,
 
-    exits: Vec<ExitReason>, // TODO: HashMap
+    exits: ProgressSetHandle<ExitReason>,
+
+    pub corpus: ProgressSetHandle<Vec<u8>>,
+
+    pub hardware_breakpoint: Option<u64>,
 
     /// Random number generator seed
     pub rng: Rng,
@@ -255,15 +270,92 @@ impl<'a> Worker<'a> {
         }
     }
 
+
+
+    // TODO: impl Iterator<u64>?
+    pub fn run_trace(&mut self) -> Vec<u64> {
+        let mut trace = Vec::with_capacity(
+            self.snapshot.coverage.lock().len()
+        );
+
+        // Enable single stepping
+        self.vm.guest_regs.rfl |= 1 << 8;
+        self.vm.preemption_timer = None;
+        self.vm.hardware_breakpoint = None;
+
+        'vm_loop: loop {
+            // Run the VM until a VM exit
+            let vmexit = self.vm.run();
+
+            match vmexit {
+                VmExit::Exception(PageFault { addr, write, .. }) => {
+                    if self.translate(addr, write).is_none() {
+                        break 'vm_loop;
+                    }
+                }
+                VmExit::Exception(InvalidOpcode) => {
+                    if self.handle_invalid_opcode().is_err() {
+                        break 'vm_loop;
+                    }
+                }
+                VmExit::Exception(DebugException) => {
+                    self.snapshot.coverage.lock()
+                        .insert(self.vm.guest_regs.rip);
+                    trace.push(self.vm.guest_regs.rip);
+                }
+                VmExit::ExternalInterrupt => {
+                    // Host interrupt happened, ignore it
+                }
+                x @ _ => panic!("Unhandled VM exit {:?}", x),
+            }
+        }
+
+        trace
+    }
+
+    fn handle_invalid_opcode(&mut self) -> Result<(), ExitReason> {
+        let mut buf = [0, 0];
+        self.read(VirtAddr(self.vm.guest_regs.rip), &mut buf).unwrap();
+        if buf != [0x0f, 0x05] {
+            return Err(ExitReason::InvalidOpcode {
+                rip: self.vm.guest_regs.rip,
+            });
+        }
+
+        let syscall = self.vm.guest_regs.rax;
+        match syscall {
+            3 => { // linux sys_close
+                self.vm.guest_regs.rax  = 0;
+                self.vm.guest_regs.rip += 2;
+                return Ok(())
+            }
+            x @ _ => {
+                return Err(ExitReason::UnhandledSyscall {
+                    rax: x,
+                    rip: self.vm.guest_regs.rip,
+                });
+            },
+        }
+    }
+
     /// Execute a single fuzz case until completion
-    pub fn run_fuzz_case(&mut self, full_coverage_run: bool) -> bool {
+    pub fn run_fuzz_case(&mut self) -> bool {
         // Counter of number of single steps we should perform
         let mut single_step = 0;
         let mut cov = false;
 
+        macro_rules! check_exit {
+            ($exit_reason:expr) => {
+                if self.exits.insert(&$exit_reason) {
+                    cov = true;
+                    print!("Unique exit reason! {:x?}\n", $exit_reason);
+                }
+            }
+        }
+
         'vm_loop: loop {
             // Check if single stepping is requested
-            if single_step > 0 || full_coverage_run {
+            if single_step > 0 {
                 // Enable single stepping
                 self.vm.guest_regs.rfl |= 1 << 8;
 
@@ -278,7 +370,16 @@ impl<'a> Worker<'a> {
 
             // Set the pre-emption timer for randomly breaking into the VM
             // to record coverage information
-            self.vm.preemption_timer = Some((self.rng.rand() & 0x3f) as u32 + 100);
+            self.vm.preemption_timer = Some((self.rng.rand() & 0x3ff) as u32 + 100);
+
+            // Prevent breakpoint loops by disabling breakpoints on single-step.
+            // After we hit the hardware breakpoint, we'll enable single_step for
+            // a few instrunctions.
+            self.vm.hardware_breakpoint = if single_step == 0 {
+                self.hardware_breakpoint
+            } else {
+                None
+            };
 
             // Run the VM until a VM exit
             let vmexit = self.vm.run();
@@ -293,67 +394,23 @@ impl<'a> Worker<'a> {
                     }
 
 
-                    let exit_reason = ExitReason::UnhandledPageFault {
+                    check_exit!(ExitReason::UnhandledPageFault {
                         rip: self.vm.guest_regs.rip,
                         addr: addr.0,
-                    };
-                    if !self.exits.contains(&exit_reason) {
-                        cov = true;
-                        print!("{:#x?}\n", exit_reason);
-                        self.exits.push(exit_reason);
-                    }
+                    });
                     break 'vm_loop; 
                 }
                 VmExit::Exception(InvalidOpcode) => {
-                    {
-                        let mut buf = [0, 0];
-                        self.read(VirtAddr(self.vm.guest_regs.rip), &mut buf).unwrap();
-                        assert_eq!(buf, [0x0f, 0x05], "InvalidOpcode but not syscall");
+                    if let Err(exit) = self.handle_invalid_opcode() {
+                        check_exit!(exit);
+                        break 'vm_loop;
                     }
-
-                    // We assume invalid opcodes are syscalls
-                    let syscall = self.vm.guest_regs.rax;
-                    match syscall {
-                        /*
-                        0x7 => {
-                            // NtDeviceIoControlFile(), return
-                            // STATUS_INVALID_PARAMETER
-                            self.vm.guest_regs.rax  = 0xC000000D;
-                            self.vm.guest_regs.rip += 2;
-                            continue 'vm_loop;
-                        }
-                        0x8 => {
-                            // NtWriteFile(), end of fuzz case
-                            break 'vm_loop;
-                        }
-                        0x1a7 => {
-                            // NtSetThreadExecutionState(), return
-                            // STATUS_INVALID_PARAMETER
-                            self.vm.guest_regs.rax  = 0xC000000D;
-                            self.vm.guest_regs.rip += 2;
-                            continue 'vm_loop;
-                        }
-                        */
-                        3 => { // linux sys_close
-                            self.vm.guest_regs.rax  = 0;
-                            self.vm.guest_regs.rip += 2;
-                            continue 'vm_loop;
-                        }
-                        x @ _ => {
-                            let exit_reason = ExitReason::UnhandledSyscall {
-                                rax: x,
-                                rip: self.vm.guest_regs.rip,
-                            };
-                            if !self.exits.contains(&exit_reason) {
-                                cov = true;
-                                print!("{:#x?}\n", exit_reason);
-                                self.exits.push(exit_reason);
-                            }
-                            break 'vm_loop; 
-                        },
-                    }
+                    continue 'vm_loop;
                 }
                 VmExit::Exception(DebugException) => {
+                    if Some(self.vm.guest_regs.rip) == self.vm.hardware_breakpoint {
+                        single_step = 4;
+                    }
                     if self.snapshot.coverage.lock()
                             .insert(self.vm.guest_regs.rip) {
                         single_step = 1000;
@@ -590,6 +647,11 @@ impl<'a> Worker<'a> {
 
         // Return the physical address of the requested virtual address
         Some(PhysAddr(page.0 + (vaddr.0 & 0xfff)))
+    }
+
+    pub fn sync(&mut self) {
+        self.exits.sync();
+        self.corpus.sync();
     }
 }
 

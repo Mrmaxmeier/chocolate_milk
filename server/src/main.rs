@@ -130,7 +130,7 @@ fn main() -> io::Result<()> {
                 if offset == 0 {
                     coverage_db.clear();
                 }
-                for &entry in &chunk {
+                for &entry in chunk.iter() {
                     coverage_db.insert(entry);
                 }
                 if coverage_db.len() as u64 == total_length {

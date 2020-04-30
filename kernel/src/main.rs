@@ -1,5 +1,48 @@
 //! A kernel written all in Rust
 
+
+/*
+SETUP: kvm 4 cores
+sample 0x3ff
+      183046 cases |   183044.315 fcps |   3976 coverage
+   212816193 cases |   173735.439 fcps |   7077 coverage => 1224s
+
+sample 0xfff + more mutations
+    17295429 cases |   243382.899 fcps |   5981 coverage
+   129412997 cases |   242218.140 fcps |   6532 coverage
+   169076992 cases |   240706.914 fcps |   6703 coverage
+   228227950 cases |   238591.356 fcps |   6775 coverage => 956s
+
+sample 0x3ff + more mutations
+     9357956 cases |   179870.110 fcps |   6235 coverage
+    38210607 cases |   182733.999 fcps |   6970 coverage => 209s
+   100179233 cases |   182046.749 fcps |   7062 coverage => 550s
+   140375286 cases |   181025.352 fcps |   7078 coverage => 775s
+
+sample 0xff + more mutations
+     4772980 cases |    83683.670 fcps |   6117 coverage => 57s
+    13830754 cases |    84805.055 fcps |   6855 coverage => 163s
+    29630238 cases |    86082.349 fcps |   7124 coverage => 344s
+    64442708 cases |    88590.469 fcps |   7287 coverage => 727s
+
+sample 0x3f + more mutations
+     6450806 cases |    37259.435 fcps |   6858 coverage => 173s
+    10693760 cases |    37761.682 fcps |   7147 coverage => 283s
+    37235641 cases |    37475.980 fcps |   7364 coverage => 993s
+    54660318 cases |    36516.051 fcps |   7384 coverage
+
+hardware breakpoint (sample 0x3ff):
+static:
+    13848237 cases |   144228.296 fcps |   6319 coverage |   43 corpus
+    47243126 cases |   144890.958 fcps |   6854 coverage |   57 corpus
+random:
+    13319665 cases |   164418.405 fcps |   5690 coverage |   36 corpus
+    47264298 cases |   168178.558 fcps |   6897 coverage |   57 corpus
+disabled:
+    14184029 cases |   186608.848 fcps |   5227 coverage |   35 corpus
+    47120569 cases |   187708.039 fcps |   6779 coverage |   56 corpus
+*/
+
 #![feature(panic_info_message, alloc_error_handler, llvm_asm, global_asm)]
 #![feature(const_in_array_repeat_expressions)]
 
@@ -27,13 +70,12 @@ pub mod net;
 pub mod time;
 pub mod vtx;
 pub mod snapshotted_app;
-pub mod corpus;
+pub mod progress_set;
 
 use lockcell::LockCell;
 use page_table::PhysAddr;
 use core_locals::LockInterrupts;
 use snapshotted_app::SnapshottedApp;
-use corpus::{Corpus, CorpusHandle};
 
 /// Release the early boot stack such that other cores can use it by marking
 /// it as available
@@ -100,17 +142,14 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // NMIs and soft reboots work.
     acpi::core_checkin();
 
+    // if core!().id != 0 { cpu::halt(); }
+
     {
         use core::sync::atomic::Ordering;
         use alloc::sync::Arc;
 
         static SNAPSHOT:
             LockCell<Option<Arc<SnapshottedApp>>, LockInterrupts> =
-            LockCell::new(None);
-
-
-        static CORPUS:
-            LockCell<Option<Arc<Corpus>>, LockInterrupts> =
             LockCell::new(None);
 
         // Create the master snapshot, and fork from it for all cores
@@ -126,14 +165,6 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
             snap.as_ref().unwrap().clone()
         };
 
-        let mut corpus = {
-            let mut corpus = CORPUS.lock();
-            if corpus.is_none() {
-                *corpus = Some(Arc::new(Corpus::new()));
-            }
-            CorpusHandle::new(corpus.as_ref().unwrap().clone())
-        };
-
         // Create a new worker for the snapshot
         let mut worker = snapshot.worker();
 
@@ -141,165 +172,171 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
         // status messages
         let it = cpu::rdtsc();
         let mut next_print = time::future(1_000_000);
+        let mut next_net_poll = time::future(250_000);
+        let mut next_net_push = time::future(250_000);
+        let mut next_explore = time::future(1_000_000);
+        let mut last_net_push_coverage = 0;
 
         let buffer_addr = snapshot.buffer_addr;
         let buffer_size = snapshot.buffer_size;
 
-        print!("buffer_addr: {:#x}\n", buffer_addr.0);
-        print!("buffer_size: {:#x}\n", buffer_size);
-
         // let mut corpus = Vec::new(); // TODO: share corpus between cores
         let mut input = vec![0; buffer_size];
-        corpus.push(input.clone());
+        worker.corpus.insert(&input);
         worker.read(buffer_addr, &mut input).unwrap();
-        corpus.push(input.clone());
+        worker.corpus.insert(&input);
 
-        let mut full_coverage_run = true;
+        /*
+        if core!().id == 0 {
+            worker.hardware_breakpoint = Some(0x55ae3782da48);
+        }
+        */
+
+        // populate coverage set with initial coverage
+        worker.run_trace();
 
         for fuzzcase in 0u64.. {
+            // Periodically sync corpus with other cores.
             if fuzzcase & 0xfff == 0 {
-                corpus.sync();
+                worker.sync();
             }
 
-            if core!().id == 0 && cpu::rdtsc() >= next_print {
-                let fuzz_cases = snapshot.fuzz_cases.load(Ordering::SeqCst);
-                let coverage   = snapshot.coverage.lock().len();
+            if core!().id == 0 {
+                let time = cpu::rdtsc();
+                if core!().id == 0 && time >= next_print {
+                    let fuzz_cases = snapshot.fuzz_cases.load(Ordering::SeqCst);
+                    let coverage   = snapshot.coverage.lock().len();
+                    let corpus   = worker.corpus.len();
 
-                print!("{:12} cases | {:12.3} fcps | {:6} coverage\n",
-                       fuzz_cases, fuzz_cases as f64 / time::elapsed(it),
-                       coverage);
+                    print!("{:12} cases | {:12.3} fcps | {:6} coverage | {:4} corpus\n",
+                        fuzz_cases, fuzz_cases as f64 / time::elapsed(it),
+                        coverage, corpus);
 
-                // SETUP: kvm 4 cores
-                // sample 0x3ff
-                //       183046 cases |   183044.315 fcps |   3976 coverage
-                //    212816193 cases |   173735.439 fcps |   7077 coverage => 1224s
+                    next_print = time::future(5_000_000);
+                }
 
-                // sample 0xfff + more mutations
-                //     17295429 cases |   243382.899 fcps |   5981 coverage
-                //    129412997 cases |   242218.140 fcps |   6532 coverage
-                //    169076992 cases |   240706.914 fcps |   6703 coverage
-                //    228227950 cases |   238591.356 fcps |   6775 coverage => 956s
-
-                // sample 0x3ff + more mutations
-                //      9357956 cases |   179870.110 fcps |   6235 coverage
-                //     38210607 cases |   182733.999 fcps |   6970 coverage => 209s
-                //    100179233 cases |   182046.749 fcps |   7062 coverage => 550s
-                //    140375286 cases |   181025.352 fcps |   7078 coverage => 775s
-
-                // sample 0xff + more mutations
-                //      4772980 cases |    83683.670 fcps |   6117 coverage => 57s
-                //     13830754 cases |    84805.055 fcps |   6855 coverage => 163s
-                //     29630238 cases |    86082.349 fcps |   7124 coverage => 344s
-                //     64442708 cases |    88590.469 fcps |   7287 coverage => 727s
-
-                // sample 0x3f + more mutations
-                //      6450806 cases |    37259.435 fcps |   6858 coverage => 173s
-                //     10693760 cases |    37761.682 fcps |   7147 coverage => 283s
-                //     37235641 cases |    37475.980 fcps |   7364 coverage => 993s
-                //     54660318 cases |    36516.051 fcps |   7384 coverage
-
-
-                // Send coverage updates
-                {
+                if time >= next_explore {
                     use alloc::vec::Vec;
-                    use crate::net::{NetDevice, UdpAddress};
-                    use falktp::ServerMessage;
-                    use crate::noodle::Serialize;
-                    use alloc::borrow::Cow;
-
-
                     let coverage = {
                         snapshot.coverage.lock()
                             .iter()
                             .copied()
                             .collect::<Vec<_>>()
                     };
-
-
-                    // Get access to a network device
-                    let netdev = NetDevice::get().unwrap();
-
-                    // Bind to a random UDP port on this network device
-                    let udp = NetDevice::bind_udp(netdev.clone()).unwrap();
-
-                    // Resolve the target
-                    let server = UdpAddress::resolve(
-                        &netdev, udp.port(), server)
-                        .expect("Couldn't resolve target address");
-
-
-                    let mut offset = 0u64;
-                    for chunk in coverage.chunks(1472/8 - 4) {
-                        let mut packet = netdev.allocate_packet();
-                        {
-                            let mut pkt = packet.create_udp(&server);
-                            ServerMessage::CovUpdate {
-                                total_length: coverage.len() as u64,
-                                offset,
-                                chunk: Cow::Borrowed(chunk),
-                            }.serialize(&mut pkt).expect("failed to serialize CovUpdate");
-                            offset += chunk.len() as u64;
-                        }
-                        netdev.send(packet, true);
+                    if !coverage.is_empty() {
+                        let idx = worker.rng.rand() % coverage.len();
+                        worker.hardware_breakpoint = Some(coverage[idx]);
                     }
+                    next_explore = time::future(100_000);
                 }
 
-                next_print = time::future(1_000_000);
+                if time >= next_net_poll {
+                    // handle ARPs
+                    if let Some(netdev) = crate::net::NetDevice::get() {
+                        let _ = netdev.recv();
+                    }
+                    next_net_poll = time::future(250_000);
+                }
 
-                // handle ARPs
-                if let Some(netdev) = crate::net::NetDevice::get() {
-                    let _ = netdev.recv();
+
+                // Send coverage updates
+                if time >= next_net_push {
+                    let coverage   = snapshot.coverage.lock().len();
+                    if coverage > last_net_push_coverage {
+                        last_net_push_coverage = coverage;
+                        use alloc::vec::Vec;
+                        use crate::net::{NetDevice, UdpAddress};
+                        use falktp::ServerMessage;
+                        use crate::noodle::Serialize;
+                        use alloc::borrow::Cow;
+
+                        let coverage = {
+                            snapshot.coverage.lock()
+                                .iter()
+                                .copied()
+                                .collect::<Vec<_>>()
+                        };
+
+                        // Get access to a network device
+                        let netdev = NetDevice::get().unwrap();
+
+                        // Bind to a random UDP port on this network device
+                        let udp = NetDevice::bind_udp(netdev.clone()).unwrap();
+
+                        // Resolve the target
+                        let server = UdpAddress::resolve(
+                            &netdev, udp.port(), server)
+                            .expect("Couldn't resolve target address");
+
+                        let mut offset = 0u64;
+                        for chunk in coverage.chunks(1472/8 - 4) {
+                            let mut packet = netdev.allocate_packet();
+                            {
+                                let mut pkt = packet.create_udp(&server);
+                                ServerMessage::CovUpdate {
+                                    total_length: coverage.len() as u64,
+                                    offset,
+                                    chunk: Cow::Borrowed(chunk),
+                                }.serialize(&mut pkt).expect("failed to serialize CovUpdate");
+                                offset += chunk.len() as u64;
+                            }
+                            netdev.send(packet, true);
+                        }
+                    }
+                    next_net_push = time::future(250_000);
                 }
             }
 
             worker.reset();
 
-            if !full_coverage_run {
-                if (worker.rng.rand() % 128) == 0 {
-                    input.copy_from_slice(
-                        &corpus.entries[
-                            worker.rng.rand() % corpus.entries.len()]);
-                }
+            if (worker.rng.rand() % 128) == 0 {
+                input.copy_from_slice(worker.corpus.sample(worker.rng.rand()));
+            }
 
-                // Corrupt the input
-
-                for _ in 0..worker.rng.rand() % 4 {
-                    match worker.rng.rand() % 4 {
-                        0|1 => {
-                            // replace
-                            let offset = worker.rng.rand() % buffer_size;
-                            input[offset as usize] = worker.rng.rand() as u8;
-                        }
-                        2 => {
-                            // insert
-                            if buffer_size < 2 { continue }
-                            let offset = worker.rng.rand() % (buffer_size-1);
-                            input.copy_within(offset..buffer_size-1, offset+1);
-                            input[offset as usize] = worker.rng.rand() as u8;
-                        }
-                        3 => {
-                            // duplicate / reduce entropy
-                            let offset_a = worker.rng.rand() % buffer_size;
-                            let offset_b = worker.rng.rand() % buffer_size;
-                            input[offset_a as usize] = input[offset_b as usize];
-                        }
-                        _ => unreachable!(),
+            // Corrupt the input
+            for _ in 0..worker.rng.rand() % 4 {
+                match worker.rng.rand() % 4 {
+                    0|1 => {
+                        // replace
+                        let offset = worker.rng.rand() % buffer_size;
+                        input[offset as usize] = worker.rng.rand() as u8;
                     }
-                };
-            }
-            worker.write(buffer_addr, &input).unwrap();
-
-            let mut pushed_new_seed = false;
-            if worker.run_fuzz_case(full_coverage_run) {
-                if !full_coverage_run {
-                    corpus.push(input.clone());
-                    corpus.sync();
-                    pushed_new_seed = true;
+                    2 => {
+                        // insert
+                        if buffer_size < 2 { continue }
+                        let offset = worker.rng.rand() % (buffer_size-1);
+                        input.copy_within(offset..buffer_size-1, offset+1);
+                        input[offset as usize] = worker.rng.rand() as u8;
+                    }
+                    3 => {
+                        // duplicate / reduce entropy
+                        let offset_a = worker.rng.rand() % buffer_size;
+                        let offset_b = worker.rng.rand() % buffer_size;
+                        input[offset_a as usize] = input[offset_b as usize];
+                    }
+                    _ => unreachable!(),
                 }
+            };
+
+            worker.write(buffer_addr, &input).unwrap();
+            if worker.run_fuzz_case() {
+                if worker.corpus.insert(&input) {
+                    let mut update_string_buf = alloc::string::String::new();
+                    update_string_buf.extend([' '; 80].iter());
+                    update_string_buf += &format!("\rnew input: {:?}\r",
+                        alloc::string::String::from_utf8_lossy(&input)
+                    );
+                    print!("{}", update_string_buf);
+                }
+
+                // make sure that the whole trace is recorded in our coverage set
+                worker.reset();
+                worker.write(buffer_addr, &input).unwrap();
+                worker.run_trace();
             }
-            full_coverage_run = pushed_new_seed;
         }
-        panic!("That's a lot of fuzz cases!")
+
+        panic!("Enough fuzzing for now :^)")
     }
 }
 
