@@ -414,7 +414,7 @@ pub struct RegisterState {
 }
 
 /// An x86 exception
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Exception {
     DivideError,
     DebugException,

@@ -8,17 +8,18 @@ use core::convert::TryInto;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::collections::{BTreeSet, BTreeMap};
+use hashbrown::HashSet;
 
 use crate::mm;
 use crate::vtx::{Vm, FxSave, RegisterState, VmExit};
-use crate::vtx::Exception::*;
+use crate::vtx::Exception::{self, *};
 use crate::net::netmapping::NetMapping;
 use crate::core_locals::LockInterrupts;
 use crate::progress_set::{ProgressSet, ProgressSetHandle};
 
 use lockcell::LockCell;
 use page_table::{PhysAddr, VirtAddr, PhysMem, PageType, Mapping};
-use page_table::{PAGE_PRESENT, PAGE_WRITE, PAGE_USER};
+use page_table::{PAGE_PRESENT, PAGE_WRITE, PAGE_USER, PAGE_NX};
 
 /// Parsed snapshot information file
 struct SnapshotInfo {
@@ -27,6 +28,9 @@ struct SnapshotInfo {
 
     /// Memory region info
     virt_to_offset: BTreeMap<VirtAddr, usize>,
+
+    /// Memory region info
+    virt_to_flags: BTreeMap<VirtAddr, (bool, bool, bool)>,
 }
 
 /// A shared state for a snapshot of an application which is being fuzzed
@@ -52,6 +56,8 @@ pub struct SnapshottedApp<'a> {
 
     /// Number of fuzz cases performed on the target
     pub fuzz_cases: AtomicU64,
+    pub vm_exits: AtomicU64,
+    pub millis_tracing: AtomicU64,
 
     pub buffer_addr: VirtAddr,
     pub buffer_size: usize,
@@ -123,36 +129,44 @@ impl<'a> SnapshottedApp<'a> {
 
         // Construct the virtual to memory offset table
         let mut virt_to_offset = BTreeMap::new();
+        let mut virt_to_flags = BTreeMap::new();
 
         // File contains a dynamic amount of MEMORY_BASIC_INFORMATION
         // structures until the end of the file
-        assert!(ptr.len() % 48 == 0, "Invalid shape for info file");
-        let mut offset = 0;
-        for chunk in ptr.chunks(48) {
+        assert!(ptr.len() % 0x20 == 0, "Invalid shape for info file");
+        for chunk in ptr.chunks(0x20) {
             // Parse out the section base and size
             let base = u64::from_le_bytes(
                 chunk[0x00..0x08].try_into().unwrap());
             let size = u64::from_le_bytes(
+                chunk[0x08..0x10].try_into().unwrap());
+            let offset = usize::from_le_bytes(
+                chunk[0x10..0x18].try_into().unwrap());
+            let flags = u64::from_le_bytes(
                 chunk[0x18..0x20].try_into().unwrap());
+            
+            let flag_r = flags & 1 != 0;
+            let flag_w = flags & 2 != 0;
+            let flag_x = flags & 4 != 0;
 
             // Make sure the size is non-zero and the base and the size are
             // both 4 KiB aligned
             assert!(size > 0 && base & 0xfff == 0 && size & 0xfff == 0);
 
+            let mut section_offset = 0;
             // Create the virtual to offset mappings
             for page in (base..=(base.checked_add(size - 1).unwrap()))
                     .step_by(4096) {
                 // Create a mapping from each page in the virtual address
                 // space of the dumped process, into the offset into the
                 // memory backing for the snapshot.
-                virt_to_offset.insert(VirtAddr(page), offset);
-                offset += 4096;
+                assert!((offset + section_offset) % 0x1000 == 0,
+                    "netmapped page not 4k aligned");
+                virt_to_offset.insert(VirtAddr(page), offset + section_offset);
+                virt_to_flags.insert(VirtAddr(page), (flag_r, flag_w, flag_x));
+                section_offset += 4096;
             }
         }
-
-        // Make sure all of the memory has been accounted for in the snapshot
-        assert!(offset == memory.len());
-
 
         let buffer_addr = VirtAddr(u64::from_le_bytes(fuzz_meta[..8].try_into().unwrap()));
         let buffer_size = usize::from_le_bytes(fuzz_meta[8..16].try_into().unwrap());
@@ -162,12 +176,15 @@ impl<'a> SnapshottedApp<'a> {
             snapshot_info: Arc::new(SnapshotInfo {
                 regs,
                 virt_to_offset,
+                virt_to_flags,
             }),
-            memory:     Arc::new(memory),
-            coverage:   LockCell::new(BTreeSet::new()),
-            exits:      Arc::new(ProgressSet::new()),
-            corpus:     Arc::new(ProgressSet::new()),
-            fuzz_cases: AtomicU64::new(0),
+            memory:         Arc::new(memory),
+            coverage:       LockCell::new(BTreeSet::new()),
+            exits:          Arc::new(ProgressSet::new()),
+            corpus:         Arc::new(ProgressSet::new()),
+            fuzz_cases:     AtomicU64::new(0),
+            vm_exits:       AtomicU64::new(0),
+            millis_tracing: AtomicU64::new(0),
             buffer_addr,
             buffer_size,
         }
@@ -184,7 +201,11 @@ impl<'a> SnapshottedApp<'a> {
             exits:    self.exits.handle(),
             corpus:   self.corpus.handle(),
             rng:      Rng::new(),
+            explore_coverage: HashSet::new(),
+            explore_corpus: Vec::new(),
             hardware_breakpoint: None,
+            fuzz_case_new_coverage: 0,
+            fuzz_case_explore: 0,
         }
     }
 }
@@ -216,27 +237,35 @@ impl Rng {
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub enum ExitReason {
-    InvalidOpcode { rip: u64 },
+    InvalidOpcode { rip: u64, bytes: [u8; 8] },
     UnhandledSyscall { rip: u64, rax: u64 },
-    UnhandledPageFault { rip: u64, addr: u64 },
+    UnhandledPageFault { rip: u64, addr: u64, write: bool },
+    UnhandledException { rip: u64, exception: crate::vtx::Exception },
+    Timeout,
 }
 
 /// A worker for fuzzing a `SnapshottedApp`
 pub struct Worker<'a> {
     /// Snapshotted application that we're a worker for fuzzing
-    snapshot: &'a SnapshottedApp<'a>,
+    pub snapshot: &'a SnapshottedApp<'a>,
 
     /// Virtual machine for running the application
     pub vm: Vm,
 
-    exits: ProgressSetHandle<ExitReason>,
+    pub exits: ProgressSetHandle<ExitReason>,
 
     pub corpus: ProgressSetHandle<Vec<u8>>,
+
+    pub explore_coverage: HashSet<u64>,
+    pub explore_corpus: Vec<Vec<u8>>,
 
     pub hardware_breakpoint: Option<u64>,
 
     /// Random number generator seed
     pub rng: Rng,
+
+    pub fuzz_case_new_coverage: u64,
+    pub fuzz_case_explore: u64,
 }
 
 impl<'a> Worker<'a> {
@@ -273,7 +302,8 @@ impl<'a> Worker<'a> {
 
 
     // TODO: impl Iterator<u64>?
-    pub fn run_trace(&mut self) -> Vec<u64> {
+    pub fn run_trace(&mut self, update_coverage: bool) -> Vec<u64> {
+        let it = cpu::rdtsc();
         let mut trace = Vec::with_capacity(
             self.snapshot.coverage.lock().len()
         );
@@ -284,8 +314,13 @@ impl<'a> Worker<'a> {
         self.vm.hardware_breakpoint = None;
 
         'vm_loop: loop {
+            if trace.len() > 100_000 {
+                print!("[WARN] timeout during run_trace\n");
+                return trace;
+            }
             // Run the VM until a VM exit
             let vmexit = self.vm.run();
+            self.snapshot.vm_exits.fetch_add(1, Ordering::Relaxed);
 
             match vmexit {
                 VmExit::Exception(PageFault { addr, write, .. }) => {
@@ -299,39 +334,87 @@ impl<'a> Worker<'a> {
                     }
                 }
                 VmExit::Exception(DebugException) => {
-                    self.snapshot.coverage.lock()
-                        .insert(self.vm.guest_regs.rip);
                     trace.push(self.vm.guest_regs.rip);
+                    if update_coverage && self.snapshot.coverage.lock()
+                            .insert(self.vm.guest_regs.rip) {
+                        self.fuzz_case_new_coverage += 1;
+                    }
                 }
                 VmExit::ExternalInterrupt => {
                     // Host interrupt happened, ignore it
+                }
+                VmExit::Exception(Exception::NMI) => {
+                    // NMIs mean we need to NMI ourself as we might need to
+                    // TLB shootdown or halt ourselves. The system may be going
+                    // down for a soft reboot
+                    unsafe {
+                        let mut apic = core!().apic().lock();
+                        let apic = apic.as_mut().unwrap();
+                        apic.ipi(core!().apic_id().unwrap(),
+                            (1 << 14) | (4 << 8));
+                    }
+
+                    // Handled the NMI, re-enter the VM
+                    continue;
+                }
+                VmExit::Exception(_) => {
+                    break 'vm_loop;
                 }
                 x @ _ => panic!("Unhandled VM exit {:?}", x),
             }
         }
 
+        let elapsed = crate::time::elapsed(it);
+        self.snapshot.millis_tracing.fetch_add(
+            (elapsed * 1000.) as u64, Ordering::SeqCst);
+
         trace
     }
 
     fn handle_invalid_opcode(&mut self) -> Result<(), ExitReason> {
-        let mut buf = [0, 0];
+        let mut buf = [0; 8];
         self.read(VirtAddr(self.vm.guest_regs.rip), &mut buf).unwrap();
-        if buf != [0x0f, 0x05] {
+        if !buf.starts_with(&[0x0f, 0x05]) {
+            {
+                // DEBUG
+                let mut buf2 = [0; 8];
+                self.read(VirtAddr(self.vm.guest_regs.rip), &mut buf2).unwrap();
+                assert_eq!(buf, buf2);
+                let page_start = self.vm.guest_regs.rip & (!0xfff);
+                self.read(VirtAddr(page_start), &mut buf2).unwrap();
+                print!("start of strange page ({:#x}):\n{:x?}\n", page_start, buf2);
+                panic!();
+            }
             return Err(ExitReason::InvalidOpcode {
                 rip: self.vm.guest_regs.rip,
+                bytes: buf,
             });
         }
 
         let syscall = self.vm.guest_regs.rax;
         match syscall {
+            /*
+            1 => { // linux sys_write
+                let count = self.vm.guest_regs.rdx;
+                self.vm.guest_regs.rax  = count;
+                self.vm.guest_regs.rip += 2;
+                return Ok(())
+            }
             3 => { // linux sys_close
                 self.vm.guest_regs.rax  = 0;
                 self.vm.guest_regs.rip += 2;
                 return Ok(())
             }
-            x @ _ => {
+            9 => { // linux sys_mmap
+                // glibc will use preallocated main arena if mmap fails
+                self.vm.guest_regs.rax = !0; // MMAP_FAILED
+                self.vm.guest_regs.rip += 2;
+                return Ok(())
+            }
+            */
+            _ => {
                 return Err(ExitReason::UnhandledSyscall {
-                    rax: x,
+                    rax: self.vm.guest_regs.rax,
                     rip: self.vm.guest_regs.rip,
                 });
             },
@@ -339,19 +422,19 @@ impl<'a> Worker<'a> {
     }
 
     /// Execute a single fuzz case until completion
-    pub fn run_fuzz_case(&mut self) -> bool {
+    pub fn run_fuzz_case(&mut self) -> ExitReason {
+        self.fuzz_case_new_coverage = 0;
+        self.fuzz_case_explore = 0;
+
+        /*
+        TODO: fix inconsistency
+        UnhandledPageFault { rip: 7ffc0c572aa2, addr: 7ffc0c56e080 }
+        */
+
         // Counter of number of single steps we should perform
         let mut single_step = 0;
-        let mut cov = false;
 
-        macro_rules! check_exit {
-            ($exit_reason:expr) => {
-                if self.exits.insert(&$exit_reason) {
-                    cov = true;
-                    print!("Unique exit reason! {:x?}\n", $exit_reason);
-                }
-            }
-        }
+        let mut timeout_instructions_remaining = 0x420_0000_u32;
 
         'vm_loop: loop {
             // Check if single stepping is requested
@@ -370,7 +453,14 @@ impl<'a> Worker<'a> {
 
             // Set the pre-emption timer for randomly breaking into the VM
             // to record coverage information
-            self.vm.preemption_timer = Some((self.rng.rand() & 0x3ff) as u32 + 100);
+            let preemption_timer = (self.rng.rand() & 0x3ff) as u32 + 1;
+            self.vm.preemption_timer = Some(preemption_timer);
+            timeout_instructions_remaining =
+                match timeout_instructions_remaining
+                    .checked_sub(preemption_timer) {
+                        Some(v) => v,
+                        None => return ExitReason::Timeout
+                    };
 
             // Prevent breakpoint loops by disabling breakpoints on single-step.
             // After we hit the hardware breakpoint, we'll enable single_step for
@@ -383,48 +473,39 @@ impl<'a> Worker<'a> {
 
             // Run the VM until a VM exit
             let vmexit = self.vm.run();
+            self.snapshot.vm_exits.fetch_add(1, Ordering::Relaxed);
+
 
             match vmexit {
                 VmExit::Exception(PageFault { addr, write, .. }) => {
                     if self.translate(addr, write).is_some() {
-                        if single_step > 0 {
-                            // print!("vmexit , {:x?}\n", vmexit);
-                        }
                         continue 'vm_loop;
                     }
 
-
-                    check_exit!(ExitReason::UnhandledPageFault {
+                    return ExitReason::UnhandledPageFault {
                         rip: self.vm.guest_regs.rip,
                         addr: addr.0,
-                    });
-                    break 'vm_loop; 
+                        write,
+                    };
                 }
                 VmExit::Exception(InvalidOpcode) => {
                     if let Err(exit) = self.handle_invalid_opcode() {
-                        check_exit!(exit);
-                        break 'vm_loop;
+                        return exit;
                     }
                     continue 'vm_loop;
                 }
-                VmExit::Exception(DebugException) => {
+                VmExit::Exception(DebugException) |
+                VmExit::PreemptionTimer => {
                     if Some(self.vm.guest_regs.rip) == self.vm.hardware_breakpoint {
+                        self.fuzz_case_explore =
+                            self.fuzz_case_explore & 0xffffffffffff0000
+                            | (self.fuzz_case_explore + 1) & 0xffff;
                         single_step = 4;
                     }
                     if self.snapshot.coverage.lock()
                             .insert(self.vm.guest_regs.rip) {
+                        self.fuzz_case_new_coverage += 1;
                         single_step = 1000;
-                        // print!("cov: {:#x}\n", self.vm.guest_regs.rip);
-                        cov = true;
-                    }
-                    continue 'vm_loop;
-                }
-                VmExit::PreemptionTimer => {
-                    if self.snapshot.coverage.lock()
-                            .insert(self.vm.guest_regs.rip) {
-                        single_step = 1000;
-                        // print!("cov: {:#x}\n", self.vm.guest_regs.rip);
-                        cov = true;
                     }
                     continue 'vm_loop;
                 }
@@ -432,14 +513,29 @@ impl<'a> Worker<'a> {
                     // Host interrupt happened, ignore it
                     continue 'vm_loop;
                 }
-                x @ _ => panic!("Unhandled VM exit {:?}", x),
+                VmExit::Exception(Exception::NMI) => {
+                    // NMIs mean we need to NMI ourself as we might need to
+                    // TLB shootdown or halt ourselves. The system may be going
+                    // down for a soft reboot
+                    unsafe {
+                        let mut apic = core!().apic().lock();
+                        let apic = apic.as_mut().unwrap();
+                        apic.ipi(core!().apic_id().unwrap(),
+                            (1 << 14) | (4 << 8));
+                    }
+
+                    // Handled the NMI, re-enter the VM
+                    continue;
+                }
+                VmExit::Exception(e) => {
+                    return ExitReason::UnhandledException {
+                        rip: self.vm.guest_regs.rip,
+                        exception: e,
+                    };
+                }
+                // x @ _ => panic!("Unhandled VM exit {:?}", x),
             }
         }
-
-        // Update number of fuzz cases
-        self.snapshot.fuzz_cases.fetch_add(1, Ordering::SeqCst);
-
-        cov
     }
 
     /// Read the contents of the virtual memory at `vaddr` in the guest into
@@ -535,6 +631,7 @@ impl<'a> Worker<'a> {
         // Get access to the snapshot memory and information
         let memory         = &self.snapshot.memory;
         let virt_to_offset = &self.snapshot.snapshot_info.virt_to_offset;
+        let virt_to_flags  = &self.snapshot.snapshot_info.virt_to_flags;
 
         // Page-align the address
         let align_addr = VirtAddr(vaddr.0 & !0xfff);
@@ -542,6 +639,9 @@ impl<'a> Worker<'a> {
         // Get the offset into the memory buffer where this virtual address is
         // present. If the virtual address is not valid this will return `None`
         let offset = *virt_to_offset.get(&align_addr)?;
+
+        let (flag_r, flag_w, flag_x) = *virt_to_flags.get(&align_addr)?;
+        assert!(flag_r, "TODO: handle non-readable pages?");
 
         // Get access to physical memory
         let mut pmem = mm::PhysicalMemory;
@@ -552,6 +652,12 @@ impl<'a> Worker<'a> {
         let translation = self.vm.page_table.translate(&mut pmem, align_addr,
                                                        write);
 
+
+        if vaddr.0 == 0x556dce882000 || vaddr.0 == 0x556dce8b1000 {
+            print!("DEBUG translation of {:#x?}:\n{:#x?}\n", vaddr.0,
+                translation);
+        }
+
         let page = if let Some(Mapping {
                 pte: Some(pte), page: Some(orig_page), .. }) = translation {
             // Page is mapped, it is possible it needs to be promoted to
@@ -559,7 +665,7 @@ impl<'a> Worker<'a> {
             
             // Check if we're requesting a write and the page is not currently
             // marked writeable
-            if write &&
+            if write && flag_w &&
                     (unsafe { mm::read_phys::<u64>(pte) } & PAGE_WRITE) == 0 {
                 // Allocate a new page
                 let page = pmem.alloc_phys(
@@ -572,10 +678,14 @@ impl<'a> Worker<'a> {
                 // mapped memory
                 psl.copy_from_slice(&memory[offset..offset + 4096]);
 
+
+                let mut flags = PAGE_PRESENT | PAGE_USER | PAGE_WRITE;
+                if !flag_x { flags |= PAGE_NX; }
+
+                assert!(vaddr.0 != 0x556dce882000 && vaddr.0 != 0x556dce8b1000);
                 // Promote the page via CoW
                 unsafe {
-                    mm::write_phys(pte, page.0 | PAGE_USER | PAGE_WRITE |
-                                   PAGE_PRESENT);
+                    mm::write_phys(pte, page.0 | flags);
                 }
 
                 page
@@ -584,8 +694,22 @@ impl<'a> Worker<'a> {
                 orig_page.0
             }
         } else {
+
+            static CONGESTION_LOCK: LockCell<(), LockInterrupts> = LockCell::new(());
+
+            // Touch the mapping to make sure it is downloaded and mapped
+            {
+                let _guard = CONGESTION_LOCK.lock();
+                unsafe { core::ptr::read_volatile(&memory[offset]); }
+            }
+
+            if vaddr.0 == 0x556dce882000 || vaddr.0 == 0x556dce8b1000 {
+                print!("DEBUG start of page {:#x?}:\n{:#x?}\n", vaddr.0,
+                unsafe { core::ptr::read_volatile(&memory[offset]); });
+            }
+
             // Page was not mapped
-            if write {
+            if write && flag_w {
                 // Page needs to be CoW-ed from the network mapped file
 
                 // Allocate a new page
@@ -599,11 +723,15 @@ impl<'a> Worker<'a> {
                 // mapped memory
                 psl.copy_from_slice(&memory[offset..offset + 4096]);
 
+                let mut flags = PAGE_PRESENT | PAGE_USER;
+                if flag_w { flags |= PAGE_WRITE; }
+                if !flag_x { flags |= PAGE_NX; }
+
+                assert!(vaddr.0 != 0x556dce882000 && vaddr.0 != 0x556dce8b1000);
                 unsafe {
                     // Map in the page as RW
                     self.vm.page_table.map_raw(&mut pmem, align_addr,
-                        PageType::Page4K,
-                        page.0 | PAGE_USER | PAGE_WRITE | PAGE_PRESENT)
+                        PageType::Page4K, page.0 | flags)
                         .unwrap();
                 }
 
@@ -613,9 +741,6 @@ impl<'a> Worker<'a> {
                 // Page is only being accessed for read. Alias the guest's
                 // virtual memory directly into the network mapped page as
                 // read-only
-                
-                // Touch the mapping to make sure it is downloaded and mapped
-                unsafe { core::ptr::read_volatile(&memory[offset]); }
 
                 // Look up the physical page backing for the mapping
                 let page = {
@@ -632,12 +757,14 @@ impl<'a> Worker<'a> {
                         .map(|x| x.page).flatten()
                         .expect("Whoa, memory page not mapped?!").0
                 };
-                
+
+                let mut flags = PAGE_PRESENT | PAGE_USER;
+                if !flag_x { flags |= PAGE_NX; }
+
                 unsafe {
                     // Map in the page as read-only into the guest page table
                     self.vm.page_table.map_raw(&mut pmem, align_addr,
-                        PageType::Page4K,
-                        page.0 | PAGE_USER | PAGE_PRESENT).unwrap();
+                        PageType::Page4K, page.0 | flags).unwrap();
                 }
 
                 // Return the physical address of the backing page

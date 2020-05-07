@@ -69,7 +69,6 @@ impl<T: Hash + PartialEq + Eq + Debug + Clone + Clone> ProgressSetHandle<T> {
         self.entries.len()
     }
 
-
     pub fn sync(&mut self) {
         let remote = self.remote.epoch.load(Ordering::SeqCst);
         if remote != self.epoch {

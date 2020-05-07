@@ -9,4 +9,5 @@ edition = "2018"
 [dependencies]
 noodle = { path = "../shared/noodle" }
 falktp = { path = "../shared/falktp" }
+sha2 = "0.8.1"
 

@@ -12,10 +12,18 @@ use std::collections::{HashMap, BTreeSet};
 use std::collections::hash_map::DefaultHasher;
 
 use noodle::*;
-use falktp::ServerMessage;
+use falktp::{ServerMessage, NodeResult, Checksum};
 
 /// If `true` prints some extra spew
 const VERBOSE: bool = true;
+
+fn write_corpus(inp: &[u8]) {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.input(inp);
+    let hash = hasher.result();
+    std::fs::write(format!("/tmp/corpus/{:#x}.bin", hash), inp).unwrap()
+}
 
 fn main() -> io::Result<()> {
     // Map from file IDs to the modified time and their contents
@@ -108,8 +116,15 @@ fn main() -> io::Result<()> {
                 });
 
                 if let Some(sliced) = sliced {
+                    let checksum = Checksum::compute(sliced);
                     sendbuf.clear();
-                    ServerMessage::ReadOk.serialize(&mut sendbuf).unwrap();
+                    ServerMessage::ReadOk {
+                        id,
+                        offset,
+                        size,
+                        checksum,
+                    }
+                        .serialize(&mut sendbuf).unwrap();
                     socket.send_to(&sendbuf, src)?;
 
                     // Send the contents
@@ -142,6 +157,27 @@ fn main() -> io::Result<()> {
                 f.write_all(b"rip_u64\n").unwrap();
                 for &entry in &coverage_db {
                     f.write_all(&u64::to_le_bytes(entry)).unwrap();
+                }
+            }
+            ServerMessage::SlightlyLossyTransport {
+                uuid,
+                length,
+                checksum,
+                offset,
+                chunk
+            } => {
+                println!("SLT: {:#x}, {}/{}", uuid, offset, length);
+                if chunk.len() < length { panic!("TODO: large path"); }
+                let data = chunk.iter().copied().collect::<Vec<_>>();
+                checksum.assert_eq(&data);
+                // Deserialize the message
+                let res = NodeResult::deserialize(&mut &data[..])
+                    .expect("Failed to deserialize NodeResult");
+                println!("{:?}", res);
+                match res {
+                    NodeResult::UniqueExit(reason, input) => write_corpus(&input),
+                    NodeResult::NewInput(input) => write_corpus(&input),
+                    _ => {}
                 }
             }
             x @ _ => panic!("Unhandled packet {:#?}\n", x),

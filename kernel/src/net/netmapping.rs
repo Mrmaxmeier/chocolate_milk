@@ -116,18 +116,35 @@ impl PageFaultHandler for NetMapHandler {
                 self.udp.device().send(packet, true);
 
                 // Wait for a success
-                if self.udp.recv_timeout(100_000, |_, udp| {
+                let res = self.udp.recv_timeout(100_000, |_, udp| {
                     let mut ptr = &udp.payload[..];
                     match ServerMessage::deserialize(&mut ptr)? {
-                        ServerMessage::ReadOk  => Some(()),
+                        ServerMessage::ReadOk {
+                            id:     echo_id,
+                            offset: echo_offset,
+                            size:   echo_size,
+                            checksum
+                        } => {
+                            if echo_id == self.file_id && echo_offset == offset
+                                    && echo_size == to_recv {
+                                Some(checksum)
+                            } else {
+                                None
+                            }
+                        },
                         ServerMessage::ReadErr =>
                             panic!("Could not satisfy network mapping read"),
-                        _ => unreachable!(),
+                        msg => {
+                            print!("DEBUG: netmapping non-read response\n");
+                            print!("{:?}", msg);
+                            None
+                        },
                     }
-                }).is_none() {
-                    // Retry
-                    continue 'retry;
-                }
+                });
+                let checksum = match res {
+                    Some(x) => x,
+                    None => continue 'retry,
+                };
 
                 // Receive the raw payload
                 let mut recv_off = 0;
@@ -147,6 +164,8 @@ impl PageFaultHandler for NetMapHandler {
                         continue 'retry;
                     }
                 }
+
+                checksum.assert_eq(&new_page[recv_off-to_recv..recv_off]);
 
                 // Received everything!
                 break;
