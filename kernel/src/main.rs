@@ -319,9 +319,10 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
                 worker.write(buffer_addr, &input).unwrap();
                 worker.run_trace(true);
 
-                // let trace_hash = worker.run_trace(true);
-                // cheap tricks to try to reduce input entropy
                 /*
+                let trace_hash = worker.run_trace(true);
+                // cheap tricks to try to reduce input entropy
+                // TODO: this is painfully slow! use a lossy similarity metric instead?
                 for i in 0..input.len() {
                     let orig = input[i];
                     if orig == 0 { continue; }
@@ -361,7 +362,7 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
                         update_string_buf += " [...]\r"
                     }
 
-                    // print!("{}", update_string_buf);
+                    print!("{}", update_string_buf);
 
                     netlink.publish(
                         falktp::NodeResult::NewInput(Cow::Borrowed(&input)));

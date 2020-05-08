@@ -272,6 +272,12 @@ impl<'a> NetMapping<'a> {
             read_only,
         })
     }
+
+    pub fn populate(&self) {
+        for page in self.backing.chunks(4096) {
+            unsafe { core::ptr::read_volatile(page.as_ptr()); }
+        }
+    }
 }
 
 impl<'a> Deref for NetMapping<'a> {

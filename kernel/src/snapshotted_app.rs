@@ -80,6 +80,10 @@ impl<'a> SnapshottedApp<'a> {
 
         let fuzz_meta = NetMapping::new(server, &format!("{}.fuzz", name), true)
             .expect("Failed to netmap info file for snapshotted app");
+        
+        info.populate();
+        fuzz_meta.populate();
+        memory.populate();
 
         // Create a new register state
         let mut regs = RegisterState::default();
@@ -314,7 +318,7 @@ impl<'a> Worker<'a> {
         self.vm.hardware_breakpoint = None;
 
         'vm_loop: loop {
-            if trace.len() > 100_000 {
+            if trace.len() > 1_000_000 {
                 print!("[WARN] timeout during run_trace\n");
                 return trace;
             }
@@ -393,7 +397,6 @@ impl<'a> Worker<'a> {
 
         let syscall = self.vm.guest_regs.rax;
         match syscall {
-            /*
             1 => { // linux sys_write
                 let count = self.vm.guest_regs.rdx;
                 self.vm.guest_regs.rax  = count;
@@ -411,7 +414,6 @@ impl<'a> Worker<'a> {
                 self.vm.guest_regs.rip += 2;
                 return Ok(())
             }
-            */
             _ => {
                 return Err(ExitReason::UnhandledSyscall {
                     rax: self.vm.guest_regs.rax,
@@ -694,20 +696,6 @@ impl<'a> Worker<'a> {
                 orig_page.0
             }
         } else {
-
-            static CONGESTION_LOCK: LockCell<(), LockInterrupts> = LockCell::new(());
-
-            // Touch the mapping to make sure it is downloaded and mapped
-            {
-                let _guard = CONGESTION_LOCK.lock();
-                unsafe { core::ptr::read_volatile(&memory[offset]); }
-            }
-
-            if vaddr.0 == 0x556dce882000 || vaddr.0 == 0x556dce8b1000 {
-                print!("DEBUG start of page {:#x?}:\n{:#x?}\n", vaddr.0,
-                unsafe { core::ptr::read_volatile(&memory[offset]); });
-            }
-
             // Page was not mapped
             if write && flag_w {
                 // Page needs to be CoW-ed from the network mapped file
@@ -727,7 +715,6 @@ impl<'a> Worker<'a> {
                 if flag_w { flags |= PAGE_WRITE; }
                 if !flag_x { flags |= PAGE_NX; }
 
-                assert!(vaddr.0 != 0x556dce882000 && vaddr.0 != 0x556dce8b1000);
                 unsafe {
                     // Map in the page as RW
                     self.vm.page_table.map_raw(&mut pmem, align_addr,
@@ -741,6 +728,9 @@ impl<'a> Worker<'a> {
                 // Page is only being accessed for read. Alias the guest's
                 // virtual memory directly into the network mapped page as
                 // read-only
+
+                // Touch the mapping to make sure it is downloaded and mapped
+                unsafe { core::ptr::read_volatile(&memory[offset]); }
 
                 // Look up the physical page backing for the mapping
                 let page = {
